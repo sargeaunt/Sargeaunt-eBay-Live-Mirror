@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Topographic Camera — Multicolor Contours</title>
+<style>
+  body,html{margin:0;height:100%;background:#000;overflow:hidden;font-family:monospace;color:#fff}
+  #splash{
+    position:fixed;inset:0;
+    background:url('https://i.imgur.com/XtWcL1E.png') center/cover no-repeat;
+    display:flex;align-items:center;justify-content:center;
+    z-index:3;transition:opacity .35s ease;
+  }
+  #splash.hide{opacity:0;pointer-events:none}
+  #startBtn{
+    position:absolute;
+    top:75%;
+    left:50%;
+    transform:translate(-50%, -50%);
+    padding:14px 28px;border-radius:12px;border:2px solid #fff;
+    background:rgba(0,0,0,.65);color:#fff;font-size:18px;cursor:pointer;
+  }
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #outCanvas{image-rendering:pixelated;transform-origin:center}
+  video,canvas.offscreen{display:none}
+  .controls{
+    position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
+    display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.5);border:2px solid #fff;border-radius:12px;
+    padding:10px 12px;z-index:2;backdrop-filter:blur(6px);visibility:hidden;
+  }
+  .group{display:flex;align-items:center;gap:8px;font-size:13px}
+  .controls input[type="range"]{width:150px}
+  .controls button{
+    background:transparent;color:#fff;border:1px solid #fff;
+    border-radius:8px;padding:6px 10px;cursor:pointer;font-size:13px
+  }
+  .controls button:hover{background:rgba(255,255,255,.08)}
+</style>
+</head>
+<body>
+  <div id="splash"><button id="startBtn">Start Camera</button></div>
+  <div id="stage"><canvas id="outCanvas"></canvas></div>
+
+  <div class="controls" id="liveCtrls">
+    <div class="group"><span>Cols</span><input id="cols" type="range" min="80" max="300" value="180"/><span id="colsVal">180</span></div>
+    <div class="group"><span>Levels</span><input id="levels" type="range" min="4" max="20" value="10"/><span id="levelsVal">10</span></div>
+    <div class="group"><span>Line</span><input id="width" type="range" min="1" max="4" value="2"/><span id="widthVal">2px</span></div>
+    <div class="group"><label><input id="smooth" type="checkbox" checked> Smooth</label></div>
+    <div class="group"><label><input id="mirror" type="checkbox" checked> Mirror</label></div>
+    <div class="group"><label><input id="invert" type="checkbox"> Invert</label></div>
+    <div class="group"><label><input id="whitebg" type="checkbox"> White BG</label></div>
+    <button id="pause">Pause</button>
+  </div>
+
+  <video id="vid" playsinline muted></video>
+  <canvas id="sampler" class="offscreen"></canvas>
+
+<script>
+(() => {
+  const TARGET_FPS = 24, targetMs = 1000 / TARGET_FPS;
+  const splash=document.getElementById('splash'), startBtn=document.getElementById('startBtn');
+  const stage=document.getElementById('stage'), canvas=document.getElementById('outCanvas'), ctx=canvas.getContext('2d');
+  const sampler=document.getElementById('sampler'), sctx=sampler.getContext('2d',{willReadFrequently:true});
+  const vid=document.getElementById('vid');
+  const liveCtrls=document.getElementById('liveCtrls');
+  const cols=document.getElementById('cols'), levels=document.getElementById('levels'), width=document.getElementById('width');
+  const smooth=document.getElementById('smooth'), mirror=document.getElementById('mirror'), invert=document.getElementById('invert'), whitebg=document.getElementById('whitebg');
+  const colsVal=document.getElementById('colsVal'), levelsVal=document.getElementById('levelsVal'), widthVal=document.getElementById('widthVal');
+  const pauseBtn=document.getElementById('pause');
+
+  let running=false, needsLayout=true, needsScale=true;
+  let GRID_COLS=parseInt(cols.value,10), GRID_ROWS=0;
+  let LINE_LEVELS=parseInt(levels.value,10), LINE_WIDTH=parseInt(width.value,10);
+  let SMOOTH=smooth.checked, MIRROR=mirror.checked, WHITE_BG=false;
+  let cellW=6, cellH=6, lastTs=0;
+
+  const ORDER_FROM_INNER=['#34A853','#FBBC05','#1A73E8','#EA4335']; // G,Y,B,R
+
+  function setGrid(){const w=vid.videoWidth,h=vid.videoHeight;if(!w||!h)return;
+    GRID_ROWS=Math.max(1,Math.floor(GRID_COLS*(h/w)));sampler.width=GRID_COLS;sampler.height=GRID_ROWS;
+    canvas.width=Math.floor(GRID_COLS*cellW);canvas.height=Math.floor(GRID_ROWS*cellH);needsScale=true;}
+  function applyScale(){const s=Math.min(stage.clientWidth/canvas.width,stage.clientHeight/canvas.height);
+    canvas.style.transform=`scale(${s})`;needsScale=false;}
+  function applyInvert(){canvas.style.filter=invert.checked?'invert(1)':'none';}
+  function applyBG(){document.body.style.background=WHITE_BG?'#fff':'#000';}
+
+  function getBrightness(){const w=sampler.width,h=sampler.height;
+    sctx.save();if(MIRROR){sctx.translate(w,0);sctx.scale(-1,1);}sctx.drawImage(vid,0,0,w,h);sctx.restore();
+    const d=sctx.getImageData(0,0,w,h).data,out=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4) out[j++]=(77*d[i]+150*d[i+1]+29*d[i+2])>>8; return out;}
+
+  function drawTopographic(bright,w,h){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.lineWidth=LINE_WIDTH; ctx.lineJoin='round';
+    const thresholds=Array.from({length:LINE_LEVELS},(_,i)=>Math.round((i+1)*(255/(LINE_LEVELS+1))));
+    const lerp=(a,b,t)=>a+(b-a)*t;
+
+    for (let li=0; li<thresholds.length; li++){
+      const t=thresholds[li];
+      const color=ORDER_FROM_INNER[(thresholds.length-1-li)%ORDER_FROM_INNER.length];
+      ctx.strokeStyle=color; ctx.beginPath();
+      for (let y=0;y<h-1;y++){
+        for (let x=0;x<w-1;x++){
+          const i00=bright[y*w+x],i10=bright[y*w+x+1],i01=bright[(y+1)*w+x],i11=bright[(y+1)*w+x+1];
+          let idx=0;if(i00>t)idx|=1;if(i10>t)idx|=2;if(i11>t)idx|=4;if(i01>t)idx|=8;
+          if(idx===0||idx===15)continue;
+          const x0=x*cellW,y0=y*cellH,x1=(x+1)*cellW,y1=(y+1)*cellH;
+          const tx0=(t-i00)/(i10-i00||1),tx1=(t-i01)/(i11-i01||1),
+                ty0=(t-i00)/(i01-i00||1),ty1=(t-i10)/(i11-i10||1);
+          const eTop={x:x0+(x1-x0)*tx0,y:y0},eRight={x:x1,y:y0+(y1-y0)*ty1},
+                eBottom={x:x0+(x1-x0)*tx1,y:y1},eLeft={x:x0,y:y0+(y1-y0)*ty0};
+          const seg=(a,b)=>{ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);};
+          switch(idx){
+            case 1: case 14: seg(eLeft,eTop); break;
+            case 2: case 13: seg(eTop,eRight); break;
+            case 3: case 12: seg(eLeft,eRight); break;
+            case 4: case 11: seg(eRight,eBottom); break;
+            case 5: seg(eLeft,eTop); seg(eRight,eBottom); break;
+            case 6: case 9: seg(eTop,eBottom); break;
+            case 7: case 8: seg(eLeft,eBottom); break;
+            case 10: seg(eTop,eRight); seg(eLeft,eBottom); break;
+          }
+        }
+      }
+      ctx.stroke();
+      if(SMOOTH){ctx.filter='blur(.0001px)';ctx.filter='none';}
+    }
+  }
+
+  function loop(ts){if(!running)return;if(ts-lastTs>=targetMs){lastTs=ts;
+      if(needsLayout)setGrid();const w=sampler.width,h=sampler.height;
+      drawTopographic(getBrightness(),w,h);if(needsScale)applyScale();}
+    requestAnimationFrame(loop);}
+
+  startBtn.onclick=async()=>{try{
+      const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+      vid.srcObject=stream;await vid.play();
+      splash.classList.add('hide');setTimeout(()=>splash.style.display='none',400);
+      liveCtrls.style.visibility='visible';applyInvert();applyBG();
+      running=true;needsLayout=true;needsScale=true;requestAnimationFrame(loop);
+    }catch(e){alert("Camera failed");}};
+
+  cols.oninput=()=>{colsVal.textContent=cols.value;GRID_COLS=parseInt(cols.value,10);needsLayout=true;};
+  levels.oninput=()=>{levelsVal.textContent=levels.value;LINE_LEVELS=parseInt(levels.value,10);};
+  width.oninput=()=>{widthVal.textContent=width.value+'px';LINE_WIDTH=parseInt(width.value,10);};
+  smooth.onchange=()=>{SMOOTH=smooth.checked;};
+  mirror.onchange=()=>{MIRROR=mirror.checked;};
+  invert.onchange=()=>applyInvert();
+  whitebg.onchange=()=>{WHITE_BG=whitebg.checked;applyBG();};
+  pauseBtn.onclick=()=>{running=!running;pauseBtn.textContent=running?'Pause':'Play';if(running)requestAnimationFrame(loop);};
+  window.onresize=()=>{needsScale=true;};
+})();
+</script>
+</body>
+</html>
